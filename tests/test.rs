@@ -675,3 +675,14 @@ fn issue_174() {
     let mut xls: Xlsx<_> = open_workbook(&path).unwrap();
     xls.worksheet_range_at(0).unwrap().unwrap();
 }
+
+#[test]
+fn date_number_format() {
+    setup();
+
+    let path = format!("{}/tests/Impfquotenmonitoring.xlsx", env!("CARGO_MANIFEST_DIR"));
+    let mut xls: Xlsx<_> = open_workbook(&path).unwrap();
+
+    let range = xls.worksheet_range("Impfungen_proTag").unwrap();
+    println!("{:#?}", range);
+}

@@ -134,6 +134,12 @@ impl FromStr for CellErrorType {
     }
 }
 
+#[derive(Debug)]
+enum CellFormat {
+    Other,
+    Date
+}
+
 /// A struct representing xml zipped excel file
 /// Xlsx, Xlsm, Xlam
 pub struct Xlsx<RS>
@@ -145,6 +151,8 @@ where
     strings: Vec<String>,
     /// Sheets paths
     sheets: Vec<(String, String)>,
+    /// Cell (number) formats
+    formats: Vec<CellFormat>,
     /// Metadata
     metadata: Metadata,
 }
@@ -166,6 +174,46 @@ impl<RS: Read + Seek> Xlsx<RS> {
                 }
                 Ok(Event::End(ref e)) if e.local_name() == b"sst" => break,
                 Ok(Event::Eof) => return Err(XlsxError::XmlEof("sst")),
+                Err(e) => return Err(XlsxError::Xml(e)),
+                _ => (),
+            }
+        }
+        Ok(())
+    }
+
+    fn read_styles(&mut self) -> Result<(), XlsxError> {
+        let mut xml = match xml_reader(&mut self.zip, "xl/styles.xml") {
+            None => return Ok(()),
+            Some(x) => x?,
+        };
+        let mut in_xfs = false;
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match xml.read_event(&mut buf) {
+                Ok(Event::Start(ref e)) if e.local_name() == b"cellXfs" => {
+                    in_xfs = true;
+                }
+                Ok(Event::Start(ref e)) if e.local_name() == b"xf" && in_xfs => {
+                    if let Some(a) = e
+                        .attributes()
+                        .filter_map(|a| a.ok())
+                        .find(|a| a.key == b"numFmtId")
+                    {
+                        self.formats.push(match &*a.value {
+                            // TODO: Handle all built-in date types.
+                            b"14" => CellFormat::Date,
+                            v => {
+                                println!("format: {:?}", std::str::from_utf8(v).unwrap());
+                                CellFormat::Other
+                            }
+                        });
+                    } else {
+                        self.formats.push(CellFormat::Other)
+                    }
+                }
+                Ok(Event::End(ref e)) if e.local_name() == b"cellXfs" => break,
+                Ok(Event::Eof) => return Err(XlsxError::XmlEof("cellXfs")),
                 Err(e) => return Err(XlsxError::Xml(e)),
                 _ => (),
             }
@@ -280,12 +328,13 @@ impl<RS: Read + Seek> Xlsx<RS> {
 
 fn worksheet<T, F>(
     strings: &[String],
+    formats: &[CellFormat],
     mut xml: XlsReader<'_>,
     read_data: &mut F,
 ) -> Result<Range<T>, XlsxError>
 where
     T: Default + Clone + PartialEq,
-    F: FnMut(&[String], &mut XlsReader<'_>, &mut Vec<Cell<T>>) -> Result<(), XlsxError>,
+    F: FnMut(&[String], &[CellFormat], &mut XlsReader<'_>, &mut Vec<Cell<T>>) -> Result<(), XlsxError>,
 {
     let mut cells = Vec::new();
     let mut buf = Vec::new();
@@ -313,7 +362,7 @@ where
                         return Err(XlsxError::UnexpectedNode("dimension"));
                     }
                     b"sheetData" => {
-                        read_data(&strings, &mut xml, &mut cells)?;
+                        read_data(&strings, &formats, &mut xml, &mut cells)?;
                         break;
                     }
                     _ => (),
@@ -338,10 +387,12 @@ impl<RS: Read + Seek> Reader for Xlsx<RS> {
         let mut xlsx = Xlsx {
             zip: ZipArchive::new(reader)?,
             strings: Vec::new(),
+            formats: Vec::new(),
             sheets: Vec::new(),
             metadata: Metadata::default(),
         };
         xlsx.read_shared_strings()?;
+        xlsx.read_styles()?;
         let relationships = xlsx.read_relationships()?;
         xlsx.read_workbook(&relationships)?;
         Ok(xlsx)
@@ -366,9 +417,10 @@ impl<RS: Read + Seek> Reader for Xlsx<RS> {
             None => return None,
         };
         let strings = &self.strings;
+        let formats = &self.formats;
         xml.map(|xml| {
-            worksheet(strings, xml?, &mut |s, xml, cells| {
-                read_sheet_data(xml, s, cells)
+            worksheet(strings, formats, xml?, &mut |s, f, xml, cells| {
+                read_sheet_data(xml, s, f, cells)
             })
         })
     }
@@ -380,8 +432,9 @@ impl<RS: Read + Seek> Reader for Xlsx<RS> {
         };
 
         let strings = &self.strings;
+        let formats = &self.formats;
         xml.map(|xml| {
-            worksheet(strings, xml?, &mut |_, xml, cells| {
+            worksheet(strings, formats, xml?, &mut |_, _, xml, cells| {
                 read_sheet(xml, cells, &mut |cells, xml, e, pos, _| {
                     match e.local_name() {
                         b"is" | b"v" => xml.read_to_end(e.name(), &mut Vec::new())?,
@@ -483,15 +536,17 @@ where
 fn read_sheet_data(
     xml: &mut XlsReader<'_>,
     strings: &[String],
+    formats: &[CellFormat],
     cells: &mut Vec<Cell<DataType>>,
 ) -> Result<(), XlsxError> {
     /// read the contents of a <v> cell
     fn read_value<'a>(
         v: String,
         strings: &[String],
-        atts: Attributes<'a>,
+        formats: &[CellFormat],
+        c_element: &BytesStart<'a>
     ) -> Result<DataType, XlsxError> {
-        match get_attribute(atts, b"t")? {
+        match get_attribute(c_element.attributes(), b"t")? {
             Some(b"s") => {
                 // shared string
                 let idx: usize = v.parse()?;
@@ -534,12 +589,29 @@ fn read_sheet_data(
                     .map_err(XlsxError::ParseFloat)
             }
             None => {
+                let is_date_time = match get_attribute(c_element.attributes(), b"s") {
+                    Ok(Some(style)) => {
+                        let id: usize = std::str::from_utf8(style).unwrap().parse()?;
+                        matches!(formats.get(id), Some(CellFormat::Date))
+                    },
+                    _ => false
+                };
+
                 // If type is not known, we try to parse as Float for utility, but fall back to
                 // String if this fails.
-                v.parse()
+                let data = v.parse()
                     .map(DataType::Float)
                     .map_err(XlsxError::ParseFloat)
-                    .or_else::<XlsxError, _>(|_| Ok(DataType::String(v)))
+                    .or_else::<XlsxError, _>(|_| Ok(DataType::String(v)));
+
+                match (data, is_date_time) {
+                    (Ok(DataType::Float(n)), true) => {
+                        // Do real conversion formula.
+                        // This is copied from https://stackoverflow.com/questions/1703505/excel-date-to-unix-timestamp
+                        Ok(DataType::DateTime((n - 25569.0) * 86400.0))
+                    }
+                    (data, _) => data
+                }
             }
             Some(b"is") => {
                 // this case should be handled in outer loop over cell elements, in which
@@ -566,7 +638,7 @@ fn read_sheet_data(
             b"v" => {
                 // value
                 let v = xml.read_text(e.name(), &mut Vec::new())?;
-                match read_value(v, strings, c_element.attributes())? {
+                match read_value(v, strings, formats, c_element)? {
                     DataType::Empty => (),
                     v => cells.push(Cell::new(pos, v)),
                 }

@@ -17,6 +17,8 @@ pub enum DataType {
     String(String),
     /// Boolean
     Bool(bool),
+    /// Date or Time
+    DateTime(f64),
     /// Error
     Error(CellErrorType),
     /// Empty cell
@@ -176,6 +178,7 @@ impl fmt::Display for DataType {
             DataType::Float(ref e) => write!(f, "{}", e),
             DataType::String(ref e) => write!(f, "{}", e),
             DataType::Bool(ref e) => write!(f, "{}", e),
+            DataType::DateTime(ref e) => write!(f, "{}", e),
             DataType::Error(ref e) => write!(f, "{}", e),
             DataType::Empty => Ok(()),
         }
